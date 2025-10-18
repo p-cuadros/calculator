@@ -1,0 +1,142 @@
+name: iOS CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build-ios:
+    name: Build, Test & Archive iOS
+    runs-on: macos-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Check if iOS folder exists
+        run: |
+          if [ ! -d ./calculator-qr-app/ios ]; then
+            echo "No iOS native project found at calculator-qr-app/ios. Skipping iOS build.";
+            exit 0;
+          fi
+
+      - name: Use Node.js 18
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+
+      - name: Install JS dependencies
+        working-directory: ./calculator-qr-app
+        run: |
+          npm ci
+
+      - name: Install CocoaPods dependencies
+        working-directory: ./calculator-qr-app/ios
+        run: |
+          gem install cocoapods -v 1.12.0 || true
+          pod install --repo-update
+
+      - name: Run JS tests
+        working-directory: ./calculator-qr-app
+        run: npm test --silent
+
+      - name: Incremental xcodebuild archive
+        working-directory: ./calculator-qr-app/ios
+        env:
+          GYM_OUTPUT_DIRECTORY: ${{ runner.temp }}/ios_build
+        run: |
+          set -e
+          xcodebuild -version
+          # Find workspace or project
+          if [ -f "./App.xcworkspace" ]; then
+            WORKSPACE_FLAG="-workspace App.xcworkspace -scheme App"
+          elif [ -f "./App.xcodeproj" ]; then
+            WORKSPACE_FLAG="-project App.xcodeproj -scheme App"
+          else
+            # try to detect any workspace
+            WS=$(ls *.xcworkspace 2>/dev/null | head -n1 || true)
+            if [ -n "$WS" ]; then
+              WORKSPACE_FLAG="-workspace $WS -scheme ${WS%.*}"
+            else
+              echo "No Xcode workspace or project found. Aborting.";
+              exit 1;
+            fi
+          fi
+          xcodebuild $WORKSPACE_FLAG -sdk iphoneos -configuration Release archive -archivePath $GYM_OUTPUT_DIRECTORY/App.xcarchive
+          # Provide a default exportOptions.plist if none exists (App Store export)
+          if [ ! -f exportOptions.plist ]; then
+            cat > exportOptions.plist <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>method</key>
+  <string>app-store</string>
+  <key>uploadBitcode</key>
+  <false/>
+  <key>compileBitcode</key>
+  <false/>
+</dict>
+</plist>
+EOF
+          fi
+          xcodebuild -exportArchive -archivePath $GYM_OUTPUT_DIRECTORY/App.xcarchive -exportOptionsPlist exportOptions.plist -exportPath $GYM_OUTPUT_DIRECTORY || true
+
+      - name: Upload IPA artifact (if exists)
+        uses: actions/upload-artifact@v4
+        with:
+          name: ios-release-ipa
+          path: ${{ runner.temp }}/ios_build
+
+  publish-ios:
+    name: Publish to TestFlight (optional)
+    needs: build-ios
+    runs-on: macos-latest
+    steps:
+      - name: Download IPA artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ios-release-ipa
+          path: ./artifacts
+
+      - name: Prepare App Store Connect API key
+        run: |
+          # Prefer base64 encoded secret which is safer for multiline JSON in GH secrets
+          if [ -n "${{ secrets.APP_STORE_CONNECT_API_KEY_BASE64 }}" ]; then
+            echo "Decoding APP_STORE_CONNECT_API_KEY_BASE64 to /tmp/appstore_connect_key.json"
+            echo "$APP_STORE_CONNECT_API_KEY_BASE64" | base64 --decode > /tmp/appstore_connect_key.json
+            export APP_STORE_CONNECT_API_KEY_FILE=/tmp/appstore_connect_key.json
+          elif [ -n "${{ secrets.APP_STORE_CONNECT_API_KEY }}" ]; then
+            echo "Writing APP_STORE_CONNECT_API_KEY secret to /tmp/appstore_connect_key.json"
+            echo "${{ secrets.APP_STORE_CONNECT_API_KEY }}" > /tmp/appstore_connect_key.json
+            export APP_STORE_CONNECT_API_KEY_FILE=/tmp/appstore_connect_key.json
+          else
+            echo "No App Store Connect API key found in secrets. Skipping TestFlight upload.";
+            exit 0;
+          fi
+
+      - name: Install Fastlane
+        run: |
+          gem install fastlane -v 2.215.0 || true
+
+      - name: Upload to TestFlight via Fastlane
+        env:
+          FASTLANE_APPLE_APPLICATION_SPECIFIC_PASSWORD: ${{ secrets.FASTLANE_APP_PASSWORD }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+        run: |
+          set -e
+          IPA_PATH=$(find ./artifacts -name "*.ipa" | head -n1 || true)
+          if [ -z "$IPA_PATH" ]; then
+            echo "No IPA found in artifacts, skipping.";
+            exit 0;
+          fi
+          # Use App Store Connect API key file if provided
+          if [ -f /tmp/appstore_connect_key.json ]; then
+            echo "Using App Store Connect API key file for authentication"
+            export APP_STORE_CONNECT_API_KEY=/tmp/appstore_connect_key.json
+            # fastlane supply/pilot will auto-detect the JSON if FASTLANE_APPLE_CONNECT_API_KEY_PATH is set
+            export FASTLANE_APPLE_CONNECT_API_KEY_PATH=/tmp/appstore_connect_key.json
+          fi
+          fastlane pilot upload -u "$APPLE_ID" -i "$IPA_PATH" --skip_waiting_for_build_processing true

@@ -1,0 +1,223 @@
+name: Android CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build, Test & Package Android
+    runs-on: ubuntu-latest
+    env:
+      JAVA_HOME: /usr/lib/jvm/java-11-openjdk-amd64
+      ANDROID_SDK_ROOT: ${{ runner.temp }}/android-sdk
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Use Node.js 18
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+
+      - name: Cache node modules
+        uses: actions/cache@v4
+        with:
+          path: |
+            **/node_modules
+            ~/.npm
+          key: ${{ runner.os }}-node-${{ hashFiles('**/package-lock.json', '**/yarn.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-node-
+
+      - name: Install dependencies (calculator-qr-app)
+        working-directory: ./calculator-qr-app
+        run: |
+          npm ci
+
+      - name: Run tests
+        working-directory: ./calculator-qr-app
+        run: npm test --silent
+
+      - name: Set up JDK 11
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '11'
+
+      - name: Install Android SDK command-line tools
+        run: |
+          mkdir -p $ANDROID_SDK_ROOT/cmdline-tools
+          cd $ANDROID_SDK_ROOT
+          curl -sSfL https://dl.google.com/android/repository/commandlinetools-linux-9477386_latest.zip -o cmdline-tools.zip
+          unzip -q cmdline-tools.zip -d cmdline-tools
+          rm cmdline-tools.zip
+          # move into expected layout
+          mkdir -p cmdline-tools/latest
+          mv cmdline-tools/cmdline-tools/* cmdline-tools/latest/
+
+      - name: Accept Android SDK licenses
+        env:
+          ANDROID_SDK_ROOT: ${{ env.ANDROID_SDK_ROOT }}
+        run: |
+          yes | $ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager --licenses || true
+
+      - name: Install required Android packages
+        env:
+          ANDROID_SDK_ROOT: ${{ env.ANDROID_SDK_ROOT }}
+        run: |
+          $ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager "platform-tools" "platforms;android-31" "build-tools;31.0.0" "ndk;21.4.7075529" || true
+
+      - name: Add SDK tools to PATH
+        run: |
+          echo "::add-path::$ANDROID_SDK_ROOT/platform-tools"
+          echo "::add-path::$ANDROID_SDK_ROOT/cmdline-tools/latest/bin"
+
+      - name: Display Java & Android info
+        run: |
+          java -version || true
+          echo ANDROID_SDK_ROOT=$ANDROID_SDK_ROOT
+          ls -la $ANDROID_SDK_ROOT || true
+
+      - name: Grant execute to gradlew
+        run: chmod +x ./calculator-qr-app/android/gradlew
+
+      - name: Build Release APK
+        working-directory: ./calculator-qr-app/android
+        run: |
+          ./gradlew assembleRelease --no-daemon -q
+
+      - name: Build Release AAB (bundle)
+        working-directory: ./calculator-qr-app/android
+        run: |
+          ./gradlew bundleRelease --no-daemon -q || true
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-release-apk
+          path: |
+            calculator-qr-app/android/app/build/outputs/apk/release/app-release.apk
+
+      - name: Upload AAB artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-release-aab
+          path: |
+            calculator-qr-app/android/app/build/outputs/bundle/release/app-release.aab
+
+      - name: Decode Android keystore (optional)
+        if: ${{ secrets.ANDROID_KEYSTORE_BASE64 != '' }}
+        run: |
+          echo "Decoding ANDROID_KEYSTORE_BASE64 to /tmp/keystore.jks"
+          echo "${{ secrets.ANDROID_KEYSTORE_BASE64 }}" | base64 --decode > /tmp/keystore.jks
+
+      - name: Sign APK if keystore provided
+        if: ${{ secrets.ANDROID_KEYSTORE_BASE64 != '' }}
+        working-directory: ./calculator-qr-app/android
+        env:
+          ANDROID_HOME: ${{ env.ANDROID_SDK_ROOT }}
+        run: |
+          set -e
+          APK_PATH=app/build/outputs/apk/release/app-release.apk
+          if [ -f "$APK_PATH" ]; then
+            echo "Found APK at $APK_PATH — signing..."
+            # detect latest build-tools dir dynamically
+            BUILD_TOOLS_DIR=$(ls -d "$ANDROID_HOME"/build-tools/* 2>/dev/null | sort -V | tail -n1 || true)
+            if [ -z "$BUILD_TOOLS_DIR" ]; then
+              echo "No build-tools directory found under $ANDROID_HOME/build-tools"; exit 1;
+            fi
+            echo "Using build-tools: $BUILD_TOOLS_DIR"
+            ZIPALIGN=$BUILD_TOOLS_DIR/zipalign
+            APKSIGNER=$BUILD_TOOLS_DIR/apksigner
+            if [ ! -x "$ZIPALIGN" ]; then
+              echo "zipalign not found at $ZIPALIGN"; exit 1;
+            fi
+            if [ ! -x "$APKSIGNER" ]; then
+              echo "apksigner not found at $APKSIGNER"; exit 1;
+            fi
+            # align
+            $ZIPALIGN -v -p 4 "$APK_PATH" /tmp/app-release-aligned.apk
+            # sign
+            $APKSIGNER sign --ks /tmp/keystore.jks --ks-pass pass:${{ secrets.KEYSTORE_PASSWORD }} --ks-key-alias ${{ secrets.KEY_ALIAS }} --key-pass pass:${{ secrets.KEY_PASSWORD }} --out /tmp/app-release-signed.apk /tmp/app-release-aligned.apk
+            echo "Verifying signed APK with apksigner..."
+            $APKSIGNER verify --print-certs /tmp/app-release-signed.apk || true
+            echo "SHA256 hashes (original/aligned/signed):"
+            sha256sum "$APK_PATH" || true
+            sha256sum /tmp/app-release-aligned.apk || true
+            sha256sum /tmp/app-release-signed.apk || true
+          else
+            echo "No APK found to sign";
+          fi
+
+      - name: Sign AAB if keystore provided
+        if: ${{ secrets.ANDROID_KEYSTORE_BASE64 != '' }}
+        working-directory: ./calculator-qr-app/android
+        env:
+          JAVA_HOME: /usr/lib/jvm/java-11-openjdk-amd64
+        run: |
+          set -e
+          AAB_PATH=app/build/outputs/bundle/release/app-release.aab
+          if [ -f "$AAB_PATH" ]; then
+            echo "Found AAB at $AAB_PATH — signing with jarsigner..."
+            jarsigner -keystore /tmp/keystore.jks -storepass "${{ secrets.KEYSTORE_PASSWORD }}" -keypass "${{ secrets.KEY_PASSWORD }}" "$AAB_PATH" "${{ secrets.KEY_ALIAS }}" || true
+            echo "Verifying AAB signature with jarsigner -verify"
+            jarsigner -verify -verbose -certs "$AAB_PATH" || true
+            echo "SHA256 hash of AAB (signed copy):"
+            sha256sum "$AAB_PATH" || true
+            # Note: aab signing may require bundletool for installation; Play Store will re-sign if using App Signing.
+            cp "$AAB_PATH" /tmp/app-release-signed.aab
+          else
+            echo "No AAB found to sign";
+          fi
+
+      - name: Upload signed APK artifact (if created)
+        if: ${{ secrets.ANDROID_KEYSTORE_BASE64 != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-release-signed-apk
+          path: /tmp/app-release-signed.apk
+
+      - name: Upload signed AAB artifact (if created)
+        if: ${{ secrets.ANDROID_KEYSTORE_BASE64 != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-release-signed-aab
+          path: /tmp/app-release-signed.aab
+
+  # publish:
+  #   name: Publish to Google Play (optional)
+  #   needs: build
+  #   runs-on: ubuntu-latest
+  #   steps:
+  #     - name: Download AAB artifact
+  #       uses: actions/download-artifact@v4
+  #       with:
+  #         name: app-release-aab
+  #         path: ./artifacts
+
+  #     - name: Check for service account secret
+  #       run: |
+  #         if [ -z "${{ secrets.GOOGLE_PLAY_SERVICE_ACCOUNT_JSON }}" ]; then
+  #           echo "No GOOGLE_PLAY_SERVICE_ACCOUNT_JSON secret configured. Skipping Play Store upload.";
+  #           exit 0;
+  #         fi
+
+  #     - name: Check AAB exists
+  #       run: |
+  #         if [ ! -f ./artifacts/app-release-aab/app-release.aab ]; then
+  #           echo "AAB artifact not found, skipping Play Store upload.";
+  #           exit 0;
+  #         fi
+
+  #     - name: Upload AAB to Google Play (internal track)
+  #       uses: r0adkll/upload-google-play@v1
+  #       with:
+  #         serviceAccountJson: ${{ secrets.GOOGLE_PLAY_SERVICE_ACCOUNT_JSON }}
+  #         packageName: ${{ secrets.GOOGLE_PLAY_PACKAGE_NAME }}
+  #         releaseFiles: ./artifacts/app-release-aab/app-release.aab
+  #         track: internal

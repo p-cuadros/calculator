@@ -1,0 +1,71 @@
+# Node
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+package-lock.json
+yarn.lock
+
+# React Native
+android/app/build/
+android/.gradle/
+android/.idea/
+android/local.properties
+android/app/*.keystore
+android/app/*.jks
+android/*.keystore
+android/*.jks
+android/gradle.properties
+
+# Android Studio
+.idea/
+*.iml
+*.ipr
+*.iws
+/.gradle/
+/.idea/
+
+# Xcode
+ios/Pods/
+ios/build/
+*.pbxuser
+!default.pbxuser
+*.mode1v3
+!default.mode1v3
+*.mode2v3
+!default.mode2v3
+*.perspectivev3
+!default.perspectivev3
+xcuserdata/
+*.xcscmblueprint
+*.xcuserstate
+*.moved-aside
+DerivedData/
+*.hmap
+*.ipa
+*.xcarchive
+
+# Fastlane
+fastlane/report.xml
+fastlane/Preview.html
+fastlane/screenshots
+fastlane/test_output
+
+# macOS
+.DS_Store
+
+# Environment
+.env
+.env.*
+secrets.properties
+*.keystore
+*.jks
+*.keystore.*
+*.p12
+
+# Misc
+.vscode/
+.history/
+.idea/
+.expo/
+/.expo-shared/
